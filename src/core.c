@@ -17,11 +17,14 @@
     along with ulatencyd. If not, see http://www.gnu.org/licenses/.
 */
 
+#define _GNU_SOURCE
+
 #include "config.h"
 #include "ulatency.h"
 
 #include "proc/procps.h"
 #include "proc/sysinfo.h"
+
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -31,6 +34,8 @@
 #include <dlfcn.h>
 #include <fnmatch.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #ifdef ENABLE_DBUS
 #include <dbus/dbus-glib.h>
@@ -49,9 +54,9 @@ static double _last_percent;
 // flag list of system wide flags
 GList *system_flags;
 int    system_flags_changed;
-// lazy rules execution
+// delay rules execution
 static long int delay;
-static GPtrArray *lazy_stack;
+static GPtrArray *delay_stack;
 
 // profiling timers
 GTimer *timer_filter;
@@ -60,9 +65,9 @@ GTimer *timer_parse;
 
 
 
-// lazy new processes
+// delay new processes
 
-struct lazy_proc {
+struct delay_proc {
 	struct timespec when;
 	u_proc  *proc;
 };
@@ -136,23 +141,23 @@ static void u_proc_remove_child_nodes(u_proc *proc) {
 
 
 /**
- * remove_proc_from_lazy_stack
+ * remove_proc_from_delay_stack
  * @pid: #pid_t pid
  *
- * removes process from the lazy stack
+ * removes process from the delay stack
  *
  * Returns: none
  */
 
-static void remove_proc_from_lazy_stack(pid_t pid) {
+static void remove_proc_from_delay_stack(pid_t pid) {
   int i = 0;
-  struct lazy_proc *cur;
+  struct delay_proc *cur;
 
-  for(i = 0; i < lazy_stack->len;) {
-      cur = g_ptr_array_index(lazy_stack, i);
+  for(i = 0; i < delay_stack->len;) {
+      cur = g_ptr_array_index(delay_stack, i);
       if(cur->proc->pid == pid) {
-          g_trace("remove lazy %d %d:%d", pid, i, lazy_stack->len);
-          g_ptr_array_remove_index_fast(lazy_stack, i);
+          u_trace("remove delay %d %d:%d", pid, i, delay_stack->len);
+          g_ptr_array_remove_index_fast(delay_stack, i);
       } else {
         i++;
       }
@@ -187,6 +192,9 @@ void u_proc_free(void *ptr) {
     luaL_unref(lua_main_state, LUA_REGISTRYINDEX, proc->lua_data);
   }
   g_hash_table_destroy (proc->skip_filter);
+
+  if(proc->tasks)
+    g_array_free(proc->tasks, TRUE);
 
   u_proc_remove_child_nodes(proc);
 
@@ -223,7 +231,7 @@ u_proc* u_proc_new(proc_t *proc) {
   rv->node = g_node_new(rv);
 
   if(proc) {
-    rv->pid = proc->tgid;
+    rv->pid = proc->tid;
     U_PROC_SET_STATE(rv,UPROC_ALIVE);
     memcpy(&(rv->proc), proc, sizeof(proc_t));
   } else {
@@ -251,6 +259,40 @@ int u_proc_ensure(u_proc *proc, enum ENSURE_WHAT what, int update) {
       return TRUE;
     else
       return process_update_pid(proc->pid);
+
+  } else if(what == TASKS) {
+
+      if(!U_PROC_SET_STATE(proc, UPROC_ALIVE))
+        return FALSE;
+
+      if(!proc->tasks) {
+          proc->tasks = g_array_new(TRUE, TRUE, sizeof(pid_t));
+      } else if (update && proc->tasks->len) {
+          g_array_remove_range(proc->tasks, 0, proc->tasks->len);
+      }
+      if(!proc->tasks->len) {
+        DIR *dip;
+        struct dirent   *dit;
+        pid_t tpid;
+
+        char *path = g_strdup_printf("/proc/%d/task", proc->pid);
+        dip = opendir(path);
+        if(!dip) {
+          g_warning("can't open %s\n", path);
+          g_free(path);
+          return FALSE;
+        }
+        while ((dit = readdir(dip)) != NULL) {
+          if(!strcmp(dit->d_name, ".") || !strcmp(dit->d_name, ".."))
+            continue;
+          tpid = (pid_t)atol(dit->d_name);
+          g_array_append_val(proc->tasks, tpid);
+        }
+        closedir(dip);
+        g_free(path);
+        return TRUE;
+      }
+
   } else if(what == ENVIRONMENT) {
       if(update && proc->environ) {
           g_hash_table_unref(proc->environ);
@@ -352,8 +394,8 @@ static void processes_free_value(gpointer data) {
 
   U_PROC_SET_STATE(proc, UPROC_INVALID);
   u_proc_remove_child_nodes(proc);
-  // remove it from the lazy stack
-  remove_proc_from_lazy_stack(proc->pid);
+  // remove it from the delay stack
+  remove_proc_from_delay_stack(proc->pid);
 
   DEC_REF(proc);
 }
@@ -530,7 +572,7 @@ static void clear_process_changed() {
 // copy the fake value of a parent pid to the child until the real value
 // of the child changes from the parent
 #define fake_var_fix(FAKE, ORG) \
-  if(proc->FAKE && (proc-> FAKE##_old != proc->proc.ORG)) { \
+  if(proc->FAKE && ((proc-> FAKE##_old != proc->proc.ORG) || (proc->FAKE == proc->proc.ORG))) { \
     /* when real value was set, the fake value disapears. */ \
     proc-> FAKE = 0; \
     proc->FAKE##_old = 0; \
@@ -593,7 +635,7 @@ int update_processes_run(PROCTAB *proctab, int full) {
   }
   memset(&buf, 0, sizeof(proc_t));
   while(readproc(proctab, &buf)){
-    proc = proc_by_pid(buf.tgid);
+    proc = proc_by_pid(buf.tid);
     if(proc) {
       // free all changable allocated buffers
       freesupgrp(&(proc->proc));
@@ -603,17 +645,18 @@ int update_processes_run(PROCTAB *proctab, int full) {
       g_hash_table_insert(processes, GUINT_TO_POINTER(proc->pid), proc);
       // we save the origin of cgroups for scheduler constrains
     }
-    if(!proc->cgroup_origin)
-      proc->cgroup_origin = g_strdupv(proc->proc.cgroup);
-
     // detect change of important parameters that will cause a reschedule
     proc->changed = proc->changed | detect_changed(&(proc->proc), &buf);
-    // remove it from lazy stack
-    remove_proc_from_lazy_stack(proc->pid);
+    // remove it from delay stack
+    remove_proc_from_delay_stack(proc->pid);
     if(full)
       proc->last_update = run;
     // we can simply steal the pointer of the current allocated buffer
     memcpy(&(proc->proc), &buf, sizeof(proc_t));
+
+    if(!proc->cgroup_origin)
+      proc->cgroup_origin = g_strdupv(proc->proc.cgroup);
+
     U_PROC_UNSET_STATE(proc, UPROC_NEW);
     U_PROC_SET_STATE(proc, UPROC_ALIVE);
     if((proctab->flags & OPENPROC_FLAGS) == OPENPROC_FLAGS) {
@@ -665,10 +708,10 @@ int update_processes_run(PROCTAB *proctab, int full) {
     removed = g_hash_table_foreach_remove(processes, 
                                           processes_is_last_changed,
                                           &run);
-    // we can completly clean the lazy stack as all processes are now processed
+    // we can completly clean the delay stack as all processes are now processed
     // missing so will cause scheduling for dead processes
-    if(lazy_stack->len)
-      g_ptr_array_remove_range(lazy_stack, 0, lazy_stack->len);
+    if(delay_stack->len)
+      g_ptr_array_remove_range(delay_stack, 0, delay_stack->len);
   }
   if(full_update) {
     rebuild_tree();
@@ -712,7 +755,7 @@ static struct timespec diff(struct timespec start, struct timespec end)
 /**
  * run_new_pid:
  *
- * called by timeout to check if processes from the lazy stack are old enough
+ * called by timeout to check if processes from the delay stack are old enough
  * to be run through the filters and scheduler
  *
  * Returns: number of process updated
@@ -720,33 +763,33 @@ static struct timespec diff(struct timespec start, struct timespec end)
 static int run_new_pid(gpointer ign) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
-    struct lazy_proc *cur;
+    struct delay_proc *cur;
     struct timespec td;
     int i;
 
     GArray *targets = NULL;
 
-    if(!lazy_stack->len)
+    if(!delay_stack->len)
       return TRUE;
 
     targets = g_array_new(TRUE, FALSE, sizeof(pid_t));
 
-    for(i = 0; i < lazy_stack->len;i++) {
-        cur = g_ptr_array_index(lazy_stack, i);
+    for(i = 0; i < delay_stack->len;i++) {
+        cur = g_ptr_array_index(delay_stack, i);
         td = diff(cur->when, now);
         //printf("test %d  %ld >= %ld\n",  cur->proc->pid, (td.tv_sec * 1000000000 + td.tv_nsec), delay);
         if((td.tv_sec * 1000000000 + td.tv_nsec) >= delay) {
-            g_trace("run filter for %d", cur->proc->pid);
+            u_trace("run filter for %d", cur->proc->pid);
             g_array_append_val(targets, cur->proc->pid);
         }
     }
     process_new_list(targets, TRUE);
 
-    // process_new_list removes the entries it processes from the lazy stack
+    // process_new_list removes the entries it processes from the delay stack
     // buf it the process is dead already, they stay here in the list. we make
     // sure they are removed.
     for(i=0; i<targets->len; i++) {
-      remove_proc_from_lazy_stack(g_array_index(targets, pid_t, i));
+      remove_proc_from_delay_stack(g_array_index(targets, pid_t, i));
     }
 
     g_array_unref(targets);
@@ -755,13 +798,13 @@ static int run_new_pid(gpointer ign) {
 
 
 /**
- * process_new_lazy:
+ * process_new_delay:
  * @pid: new pid to create
  * @parent: pid of parent process
  *
- * this function creates a lazy process. This means that a #u_proc instance is
+ * this function creates a delay process. This means that a #u_proc instance is
  * created and linked into the process tree, but the process is not parsed and 
- * the rules and scheduler run on it. If the lazy process sticks in the system
+ * the rules and scheduler run on it. If the delay process sticks in the system
  * for the configured "delay" or is updated by the full update in between, the
  * process will be parsed fully and run through the rules and scheduler.
  * This is the prefered way to notifiy the core of new processes as it allows to
@@ -770,9 +813,9 @@ static int run_new_pid(gpointer ign) {
  *
  * Returns: boolean. TRUE if process could be created.
  */
-gboolean process_new_lazy(pid_t pid, pid_t parent) {
+gboolean process_new_delay(pid_t pid, pid_t parent) {
   u_proc *proc, *proc_parent;
-  struct lazy_proc *lp;
+  struct delay_proc *lp;
   g_assert(pid != 0);
   if(!delay) {
       return process_new(pid, TRUE);
@@ -782,7 +825,7 @@ gboolean process_new_lazy(pid_t pid, pid_t parent) {
     if(parent) {
       proc = u_proc_new(NULL);
       proc->pid = pid;
-      proc->proc.tgid = pid;
+      proc->proc.tid = pid;
       proc->proc.ppid = parent;
       U_PROC_SET_STATE(proc, UPROC_HAS_PARENT);
       // put it into the lists
@@ -796,10 +839,10 @@ gboolean process_new_lazy(pid_t pid, pid_t parent) {
       if(!proc)
         return FALSE;
     }
-    lp = g_malloc(sizeof(struct lazy_proc));
+    lp = g_malloc(sizeof(struct delay_proc));
     lp->proc = proc;
     clock_gettime(CLOCK_MONOTONIC, &(lp->when));
-    g_ptr_array_add(lazy_stack, lp);
+    g_ptr_array_add(delay_stack, lp);
   }
   return TRUE;
 }
@@ -1155,7 +1198,7 @@ int filter_run_for_proc(gpointer data, gpointer user_data) {
     g_hash_table_insert(proc->skip_filter, GUINT_TO_POINTER(flt), flt_block);
   }
 
-  flt_block->pid = proc->proc.tgid;
+  flt_block->pid = proc->proc.tid;
 
   timeout = FILTER_TIMEOUT(rv);
   flags = FILTER_FLAGS(rv);
@@ -1346,13 +1389,12 @@ u_scheduler *scheduler_get() {
  **************************************************************************/
 
 int load_rule_directory(char *path, char *load_pattern, int fatal) {
-  DIR             *dip;
-  struct dirent   *dit;
   char rpath[PATH_MAX+1];
   gsize  disabled_len;
-  int i;
+  int i, j;
   char **disabled;
-  char *rule_name;
+  char *rule_name = NULL;
+  struct stat sb;
 
   disabled = g_key_file_get_string_list(config_data, CONFIG_CORE,
                                         "disabled_rules", &disabled_len, NULL);
@@ -1360,39 +1402,50 @@ int load_rule_directory(char *path, char *load_pattern, int fatal) {
 
   g_message("load rule directory: %s", path);
 
-  if ((dip = opendir(path)) == NULL)
-  {
-    perror("opendir");
-    return 1;
+
+  struct dirent **namelist;
+  int n;
+
+  n = scandir(path, &namelist, 0, versionsort);
+  if (n < 0) {
+     perror("scandir");
+  } else {
+     for(i = 0; i < n; i++) {
+
+        if(fnmatch("*.lua", namelist[i]->d_name, 0))
+          continue;
+        rule_name = g_strndup(namelist[i]->d_name,strlen(namelist[i]->d_name)-4);
+        if(load_pattern && (fnmatch(load_pattern, namelist[i]->d_name, 0) != 0))
+          goto skip;
+
+        for(j = 0; j < disabled_len; j++) {
+          if(!g_strcasecmp(disabled[j], rule_name))
+            goto skip;
+        }
+
+        snprintf(rpath, PATH_MAX, "%s/%s", path, namelist[i]->d_name);
+        if (stat(rpath, &sb) == -1)
+            goto skip;
+        if((sb.st_mode & S_IFMT) != S_IFREG)
+            goto next;
+
+        if(load_lua_rule_file(lua_main_state, rpath) && fatal)
+          abort();
+    next:
+        g_free(rule_name);
+        rule_name = NULL;
+
+        free(namelist[i]);
+        continue;
+    skip:
+        g_debug("skip rule: %s", namelist[i]->d_name);
+        g_free(rule_name);
+        rule_name = NULL;
+
+        free(namelist[i]);
+     }
+     free(namelist);
   }
-
-  if(load_pattern)
-    g_message("load pattern: %s", load_pattern);
-
-  while ((dit = readdir(dip)) != NULL)
-  {
-    if(fnmatch("*.lua", dit->d_name, 0))
-      continue;
-    rule_name = g_strndup(dit->d_name,strlen(dit->d_name)-4);
-    if(load_pattern && (fnmatch(load_pattern, dit->d_name, 0) != 0))
-      goto skip;
-
-    for(i = 0; i < disabled_len; i++) {
-      if(!g_strcasecmp(disabled[i], rule_name))
-        goto skip;
-    }
-
-    snprintf(rpath, PATH_MAX, "%s/%s", path, dit->d_name);
-    if(load_lua_rule_file(lua_main_state, rpath) && fatal)
-      abort();
-    g_free(rule_name);
-    continue;
-skip:
-    g_debug("skip rule: %s", dit->d_name);
-    g_free(rule_name);
-  }
-  g_strfreev(disabled);
-  free(dip);
   return 0;
 }
 
@@ -1490,8 +1543,8 @@ int core_init() {
     g_warning("failed to setup dbus");
 #endif
 
-  // lazy stack 
-  lazy_stack = g_ptr_array_new_with_free_func(free);
+  // delay stack 
+  delay_stack = g_ptr_array_new_with_free_func(free);
   delay = g_key_file_get_integer(config_data, CONFIG_CORE, "delay_new_pid", NULL);
 
   processes_tree = g_node_new(NULL);

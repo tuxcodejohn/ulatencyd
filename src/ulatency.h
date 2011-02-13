@@ -34,18 +34,24 @@
 //#include <libcgroup.h>
 
 
-#define G_LOG_LEVEL_TRACE   1 << 8
-#define g_trace(...)    g_log (G_LOG_DOMAIN,         \
-                               G_LOG_LEVEL_TRACE,    \
+#define U_LOG_LEVEL_SCHED   1 << 8
+#define u_sched(...)    g_log (G_LOG_DOMAIN,         \
+                               U_LOG_LEVEL_SCHED,    \
                                __VA_ARGS__)
 
-#define VERSION 0.4.1
+#define U_LOG_LEVEL_TRACE   1 << 9
+#define u_trace(...)    g_log (G_LOG_DOMAIN,         \
+                               U_LOG_LEVEL_TRACE,    \
+                               __VA_ARGS__)
+
+
+#define VERSION 0.4.6
 
 #define OPENPROC_FLAGS (PROC_FILLMEM | \
   PROC_FILLUSR | PROC_FILLGRP | PROC_FILLSTATUS | PROC_FILLSTAT | \
   PROC_FILLWCHAN | PROC_FILLCGROUP | PROC_FILLSUPGRP | PROC_FILLCGROUP)
 
-#define OPENPROC_FLAGS_MINIMAL (PROC_FILLSTATUS | PROC_FILLCGROUP)
+#define OPENPROC_FLAGS_MINIMAL (PROC_FILLSTATUS)
 
 
 #define CONFIG_CORE "core"
@@ -144,6 +150,8 @@ typedef struct _u_proc {
   int           changed; // flags or main parameters of process like uid, gid, sid
   void          *filter_owner;
   int           block_scheduler; // this should be respected by the scheduler
+  GArray        *tasks; // pointer array of all task process pids. These are threads in userspace
+
   int           lua_data;
   // we don't use the libproc parsers here as we do not update these values
   // that often
@@ -323,6 +331,7 @@ enum ENSURE_WHAT {
   ENVIRONMENT,
   CMDLINE,
   EXE,
+  TASKS,
 };
 
 int u_proc_ensure(u_proc *proc, enum ENSURE_WHAT what, int update);
@@ -340,7 +349,7 @@ void cp_proc_t(const struct proc_t *src, struct proc_t *dst);
 
 // notify system of a new pids/changed/dead pids
 int process_new(pid_t pid, int noupdate);
-int process_new_lazy(pid_t pid, pid_t parent);
+int process_new_delay(pid_t pid, pid_t parent);
 int process_new_list(GArray *list, int noupdate);
 int process_remove(u_proc *proc);
 int process_remove_by_pid(pid_t pid);

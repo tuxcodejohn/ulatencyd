@@ -66,7 +66,8 @@ struct x_server {
 
 static void free_x_server(struct x_server *xs) {
   g_debug("remove x_server display: %s", xs->display);
-  xcb_disconnect (xs->connection);
+  if(xs->connection)
+      xcb_disconnect (xs->connection);
   g_free(xs->name);
   g_free(xs->display);
 }
@@ -139,10 +140,12 @@ int create_connection(struct x_server *xs) {
 
   xs->last_try = time(NULL);
 
+  g_debug("create x-watch connection: '%s'", xs->display);
+
   parsed = xcb_parse_display(xs->display, &host, &dsp, &screenNum);
 
   if(!parsed) {
-    g_warning("can't parse display: %s", xs->display);
+    g_warning("can't parse display: '%s'", xs->display);
     return FALSE;
   }
 
@@ -208,7 +211,7 @@ int create_connection(struct x_server *xs) {
   xs->screen = iter.data;
 
 
-  g_debug("setup connection to X11 host: %s display: %d screen: %d", localhost, dsp, screenNum);
+  g_message("connected to X11 host: %s display: %d screen: %d", localhost, dsp, screenNum);
 
   // fillup the x server atoms
   xcb_intern_atom_cookie_t net_active_ck
@@ -329,6 +332,7 @@ struct x_server *add_connection(const char *name, uid_t uid, const char *display
 pid_t read_pid(struct x_server *conn, int *err) {
   xcb_generic_error_t *error;
   *err = 0;
+  pid_t rv;
 
   dprint("dsp: %s xs: %p conn: %p\n", conn->display, conn, conn->connection);
 
@@ -340,6 +344,7 @@ pid_t read_pid(struct x_server *conn, int *err) {
                       conn->window_atom,
                       0,
                       1);
+
   xcb_get_property_reply_t *rep =
     xcb_get_property_reply (conn->connection,
                           naw,
@@ -351,6 +356,7 @@ pid_t read_pid(struct x_server *conn, int *err) {
   dprint("len: %d ", xcb_get_property_value_length (rep));
   uint32_t *win = xcb_get_property_value(rep);
   dprint("win: 0x%x\n", *win);
+  g_free(rep);
 
   xcb_get_property_cookie_t caw =
     xcb_get_property (conn->connection,
@@ -360,20 +366,22 @@ pid_t read_pid(struct x_server *conn, int *err) {
                     conn->cardinal_atom,
                     0,
                     1);
+
   xcb_get_property_reply_t *rep2 =
     xcb_get_property_reply (conn->connection,
                         caw,
                         &error);
 
-  if(error && error->response_type == 0)
+  if((error && error->response_type == 0) || 
+     !rep2 || !xcb_get_property_value_length(rep2)) {
+    g_free(rep2);
     goto error;
-
-  if(!rep2 || !xcb_get_property_value_length(rep2))
-    return 0;
+  }
 
   dprint("len: %d ", xcb_get_property_value_length (rep2));
   uint32_t *pid = xcb_get_property_value(rep2);
   dprint("pid: %d\n", *pid);
+  g_free(rep2);
 
   xcb_get_property_cookie_t ccaw =
     xcb_get_property (conn->connection,
@@ -383,16 +391,17 @@ pid_t read_pid(struct x_server *conn, int *err) {
                   conn->string_atom,
                   0,
                   strlen(localhost));
+
   xcb_get_property_reply_t *rep3 =
     xcb_get_property_reply (conn->connection,
                         ccaw,
                         &error);
 
-  if(error && error->response_type == 0)
+  if((error && error->response_type == 0) ||
+    !rep3 || !xcb_get_property_value_length(rep3)) {
+    g_free(rep3);
     goto error;
-
-  if(!rep3 || !xcb_get_property_value_length(rep3))
-    return 0;
+  }
 
   char *client =  xcb_get_property_value(rep3);
 #ifdef DEBUG_XWATCH
@@ -401,9 +410,12 @@ pid_t read_pid(struct x_server *conn, int *err) {
   g_free(tmp);
 #endif
   if(client && !strncmp(client, localhost, xcb_get_property_value_length(rep3))) {
-    return *pid;
+    rv = *pid;
   }
-  return 0;
+
+  g_free(rep3);
+
+  return rv;
 error:
   // error in connection. free x_server connection
   if(error->response_type == 0 && error->error_code == 3)
@@ -462,7 +474,7 @@ static gboolean update_all_server(gpointer data) {
       }
       xcur = g_list_next(xcur);
     }
-    if(!found) {
+    if(!found && sess->X11Display && strcmp(sess->X11Display, "")) {
       add_connection(sess->name, sess->uid, sess->X11Display);
     }
 

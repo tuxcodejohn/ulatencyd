@@ -634,6 +634,24 @@ static int u_proc_list_flags (lua_State *L) {
   return 1;
 }
 
+static int u_proc_get_tasks (lua_State *L) {
+  int i = 0;
+  u_proc *proc = check_u_proc(L, 1);
+  int update = lua_toboolean(L, 2);
+
+  u_proc_ensure(proc, TASKS, update);
+
+  lua_newtable(L);
+  for(; i < proc->tasks->len; i++) {
+      lua_pushinteger(L, i+1);
+      lua_pushinteger(L, g_array_index(proc->tasks, pid_t, i));
+      lua_settable(L, -3);
+  }
+  return 1;
+}
+
+
+
 static int u_proc_add_flag (lua_State *L) {
   u_proc *proc = check_u_proc(L, 1);
   u_flag *flag = check_u_flag(L, 2);
@@ -696,7 +714,8 @@ static int u_proc_kill (lua_State *L) {
   }
   
   if(U_PROC_IS_VALID(proc)) {
-    kill(proc->proc.tgid, signal);
+    printf("send pid %d signal %d\n", proc->proc.tid, signal);
+    kill(proc->proc.tid, signal);
   }
   
   return 0;
@@ -706,7 +725,7 @@ static int u_proc_kill (lua_State *L) {
 static int u_proc_get_n_children (lua_State *L) {
   u_proc *proc = check_u_proc(L, 1);
 
-  if(!U_PROC_HAS_STATE(proc, UPROC_ALIVE))
+  if(!U_PROC_IS_VALID(proc))
     return 0;
 
   lua_pushinteger(L, g_node_n_children(proc->node));
@@ -874,104 +893,45 @@ static int u_proc_ioprio_get (lua_State *L) {
     return 1; \
   }
 
+static const luaL_reg u_proc_methods[] = {
+  {"get_parent", u_proc_get_parent},
+  {"get_children", u_proc_get_children},
+  {"list_flags", u_proc_list_flags},
+  {"add_flag", u_proc_add_flag},
+  {"del_flag", u_proc_del_flag},
+  {"clear_flag_name", u_proc_clear_flag_name},
+  {"clear_flag_source", u_proc_clear_flag_source},
+  {"clear_flag_all", u_proc_clear_flag_all},
+  {"clear_changed", u_proc_clear_changed},
+  {"kill", u_proc_kill},
+  {"get_n_children", u_proc_get_n_children},
+  {"get_n_nodes", u_proc_get_n_nodes},
+  {"set_block_scheduler", u_proc_set_block_scheduler},
+  {"set_rtprio", u_proc_set_rtprio},
+  {"set_pgid", u_proc_set_pgid},
+  {"set_oom_score", u_proc_set_oom_score},
+  {"get_oom_score", u_proc_get_oom_score},
+  {"set_ioprio", u_proc_ioprio_set},
+  {"get_ioprio", u_proc_ioprio_get},
+  {"get_tasks", u_proc_get_tasks},
+  {NULL,NULL}
+};
 
 static int u_proc_index (lua_State *L)
 {
   //char        path[PROCPATHLEN];
   u_proc *proc = check_u_proc(L, 1);
   const char *key = luaL_checkstring(L, 2);
+  luaL_reg *lreg = (luaL_reg *)u_proc_methods;
 
-/*
 
-  //FIXME this should be handled by u_proc_methods somehow
-
-  //lua_getmetatable (L, 1);
-  lua_pushvalue(L, 2);
-  stackdump_g(L);
-
-  lua_rawget(L, 1);
-  stackdump_g(L);
-  
-  if(lua_isnil(L, 1)) {
-    lua_pop(L, 1);
-  } else {
-    return 1;
-  }
-  stackdump_g(L);
-*/  
-/*  if(luaL_getmetafield (L, 1, key)) {
-    //lua_insert (L, 1);
-    //lua_call (L, lua_gettop(L)-1, LUA_MULTRET);
-    printf("got something\n");
-    return 1;
-  }
-*/
-  if(!strcmp(key, "get_parent" )) { \
-    lua_pushcfunction(L, u_proc_get_parent);
-    return 1;
-  }
-  if(!strcmp(key, "get_children" )) { \
-    lua_pushcfunction(L, u_proc_get_children);
-    return 1;
+  for (; lreg->name; lreg++) {
+    if(strcmp(lreg->name, key) == 0) {
+      lua_pushcfunction(L, lreg->func);
+      return 1;
+    }
   }
 
-  if(!strcmp(key, "list_flags" )) { \
-    lua_pushcfunction(L, u_proc_list_flags);
-    return 1;
-  }
-  if(!strcmp(key, "add_flag" )) { \
-    lua_pushcfunction(L, u_proc_add_flag);
-    return 1;
-  } else if(!strcmp(key, "del_flag" )) { \
-    lua_pushcfunction(L, u_proc_del_flag);
-    return 1;
-  } else if(!strcmp(key, "clear_flag_name" )) { \
-    lua_pushcfunction(L, u_proc_clear_flag_name);
-    return 1;
-  } else if(!strcmp(key, "clear_flag_source" )) { \
-    lua_pushcfunction(L, u_proc_clear_flag_source);
-    return 1;
-  } else if(!strcmp(key, "clear_flag_all" )) { \
-    lua_pushcfunction(L, u_proc_clear_flag_all);
-    return 1;
-  } else if(!strcmp(key, "clear_changed" )) { \
-    lua_pushcfunction(L, u_proc_clear_changed);
-    return 1;
-  } else if(!strcmp(key, "kill" )) {
-    lua_pushcfunction(L, u_proc_kill);
-    return 1;
-  } else if(!strcmp(key, "get_n_children" )) {
-    lua_pushcfunction(L, u_proc_get_n_children);
-    return 1;
-  } else if(!strcmp(key, "get_n_nodes" )) {
-    lua_pushcfunction(L, u_proc_get_n_nodes);
-    return 1;
-  } else if(!strcmp(key, "set_block_scheduler" )) {
-    lua_pushcfunction(L, u_proc_set_block_scheduler);
-    return 1;
-  } else if(!strcmp(key, "set_rtprio" )) {
-    lua_pushcfunction(L, u_proc_set_rtprio);
-    return 1;
-  } else if(!strcmp(key, "set_pgid" )) {
-    lua_pushcfunction(L, u_proc_set_pgid);
-    return 1;
-  } else if(!strcmp(key, "set_oom_score" )) {
-    lua_pushcfunction(L, u_proc_set_oom_score);
-    return 1;
-  } else if(!strcmp(key, "get_oom_score" )) {
-    lua_pushcfunction(L, u_proc_get_oom_score);
-    return 1;
-  } else if(!strcmp(key, "set_ioprio" )) {
-    lua_pushcfunction(L, u_proc_ioprio_set);
-    return 1;
-  } else if(!strcmp(key, "get_ioprio" )) {
-    lua_pushcfunction(L, u_proc_ioprio_get);
-    return 1;
-  }
-  
-  
-  
-  
 
   if(!strcmp(key, "is_valid" )) { \
     lua_pushboolean(L, U_PROC_IS_VALID(proc));
@@ -1005,7 +965,7 @@ static int u_proc_index (lua_State *L)
   }
 
   if(!u_proc_ensure(proc, BASIC, FALSE)) {
-    lua_pushliteral(L, "u_proc basic data not available");
+    lua_pushfstring (L, "u_proc<pid %d> basic data not available ", proc->pid);
     lua_error(L);
   }
 
@@ -1147,8 +1107,12 @@ static int u_proc_index (lua_State *L)
     lua_pushinteger(L, proc->fake_pgrp ? proc->fake_pgrp : (lua_Integer)proc->proc.pgrp);
     return 1;
   }
-  PUSH_INT(session)
+  if(!strcmp(key, "session" )) {
+    lua_pushinteger(L, proc->fake_session ? proc->fake_session : (lua_Integer)proc->proc.session);
+    return 1;
+  }
   PUSH_INT(nlwp)
+  PUSH_INT(tid)
   PUSH_INT(tgid)
   PUSH_INT(tty)
   PUSH_INT(euid)
@@ -1828,10 +1792,6 @@ static const luaL_reg u_proc_meta[] = {
   {NULL, NULL}
 };
 
-static const luaL_reg u_proc_methods[] = {
-  {NULL,NULL}
-};
-
 static int l_process_update (lua_State *L) {
   // DANGEROUS: can cause endless loop
   int pid = lua_tointeger(L, 1);
@@ -1870,14 +1830,20 @@ static int l_get_time (lua_State *L) {
 
 
 static int user_load_lua_rule_file(lua_State *L) {
-  char *full;
+  char *full, *full2;
   const char *name = luaL_checkstring(L, 1);
   int abs = lua_toboolean(L, 2);
-
   if(!abs) {
     full = g_strconcat(QUOTEME(RULES_DIRECTORY), "/", name, NULL);
-    lua_pushboolean(L, !load_lua_rule_file(L, full));
+    full2 = realpath(full, NULL);
+    if(!full2) {
+      g_warning("load_rule_file: realpath failed for %s", full);
+      g_free(full);
+      return 0;
+    }
+    lua_pushboolean(L, !load_lua_rule_file(L, full2));
     g_free(full);
+    g_free(full2);
   } else {
     lua_pushboolean(L, !load_lua_rule_file(L, name));
   }
@@ -1950,6 +1916,15 @@ static int l_get_sessions(lua_State *L) {
     }
     return 1;
 }
+
+#ifdef DEVELOP_MODE
+static int l_trap(lua_State *L) {
+  asm("int3");
+  return 0;
+}
+#endif
+
+
 /* object table */
 static const luaL_reg R[] = {
   // system load
@@ -2003,6 +1978,10 @@ static const luaL_reg R[] = {
   {"load_rule", user_load_lua_rule_file},
   {"process_update", l_process_update},
   {"run_iteration", l_run_interation},
+#ifdef DEVELOP_MODE
+  {"trap", l_trap},
+#endif
+
 	{NULL,        NULL}
 };
 
@@ -2050,6 +2029,8 @@ int luaopen_ulatency(lua_State *L) {
   PUSH_INT(LOG_LEVEL_MESSAGE, G_LOG_LEVEL_MESSAGE)
   PUSH_INT(LOG_LEVEL_INFO, G_LOG_LEVEL_INFO)
   PUSH_INT(LOG_LEVEL_DEBUG, G_LOG_LEVEL_DEBUG)
+  PUSH_INT(LOG_LEVEL_SCHED, U_LOG_LEVEL_SCHED)
+  PUSH_INT(LOG_LEVEL_TRACE, U_LOG_LEVEL_TRACE)
   
   PUSH_INT(FILTER_STOP, FILTER_STOP)
   PUSH_INT(FILTER_SKIP_CHILD, FILTER_SKIP_CHILD)

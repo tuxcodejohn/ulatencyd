@@ -44,6 +44,15 @@ end
 
 
 -- logging shortcuts
+
+function ulatency.log_trace(msg)
+  ulatency.log(ulatency.LOG_LEVEL_TRACE, msg)
+end
+
+function ulatency.log_sched(msg)
+  ulatency.log(ulatency.LOG_LEVEL_SCHED, msg)
+end
+
 function ulatency.log_debug(msg)
   ulatency.log(ulatency.LOG_LEVEL_DEBUG, msg)
 end
@@ -184,7 +193,6 @@ end
 
 function ulatency.get_sysctl(name)
   local pname = string.gsub(name, "%.", "/")
-  print("open".."/proc/sys/" .. pname)
   local fp = io.open("/proc/sys/" .. pname)
   if not fp then
     return nil
@@ -226,10 +234,12 @@ local function mkdirp(path)
       if posix.access(name, posix.R_OK) ~= 0 then
         if posix.mkdir(name) ~= 0 then
           cg_log("can't create "..name)
+          return false
         end
       end
     end
   end
+  return true
 end
 
 
@@ -253,19 +263,6 @@ if string.sub(CGROUP_ROOT, -1) ~= "/" then
   CGROUP_ROOT = CGROUP_ROOT .. "/"
 end
 
--- try mounting the mountpoints
-mkdirp(CGROUP_ROOT)
-
--- disable the autogrouping
-local fp = io.open("/proc/sys/kernel/sched_autogroup_enabled", "w")
-if fp then
-  ulatency.log_info("disable sched_autogroup in linux kernel")
-  fp:write("0")
-  fp:close()
-end
-
-ulatency.log_info("available cgroup subsystems: "..table.concat(ulatency.get_cgroup_subsystems(), ", "))
-
 -- test if a cgroups is mounted
 local function is_mounted(mnt_pnt)
   if string.sub(mnt_pnt, #mnt_pnt) == "/" then
@@ -279,11 +276,32 @@ local function is_mounted(mnt_pnt)
   return false
 end
 
+-- try mounting the mountpoints
+if not is_mounted(CGROUP_ROOT) then
+  -- try mounting a tmpfs there
+  local prog = "/bin/mount -n -t tmpfs none "..CGROUP_ROOT.."/"
+  ulatency.log_info("mount cgroups root: "..prog)
+  fd = io.popen(prog, "r")
+  print(fd:read("*a"))
+  if not is_mounted(CGROUP_ROOT) then
+    ulatency.log_error("can't mount: "..CGROUP_ROOT)
+  end
+end
+
+-- disable the autogrouping
+local fp = io.open("/proc/sys/kernel/sched_autogroup_enabled", "w")
+if fp then
+  ulatency.log_info("disable sched_autogroup in linux kernel")
+  fp:write("0")
+  fp:close()
+end
+
+ulatency.log_info("available cgroup subsystems: "..table.concat(ulatency.get_cgroup_subsystems(), ", "))
+
 local __found_one_group = false
 for n,v in pairs(CGROUP_MOUNTPOINTS) do
   local path = CGROUP_ROOT..n
   local mnt_opts = false
-  mkdirp(path)
   for i, subsys in ipairs(v) do
     if ulatency.has_cgroup_subsystem(subsys) then
       if mnt_opts then
@@ -299,20 +317,28 @@ for n,v in pairs(CGROUP_MOUNTPOINTS) do
       __CGROUP_LOADED[n] = true
       __found_one_group = true
     else
-      prog = "/bin/mount -t cgroup -o "..mnt_opts.." none "..path.."/"
+      mkdirp(path)
+      local prog = "/bin/mount -n -t cgroup -o "..mnt_opts.." none "..path.."/"
       ulatency.log_info("mount cgroups: "..prog)
       fd = io.popen(prog, "r")
       print(fd:read("*a"))
       if not is_mounted(path) then
         ulatency.log_error("can't mount: "..path)
       else
-        fp = io.open(path.."/release_agent", "w")
-        if fp then
-          fp:write(ulatency.release_agent)
-          fp:close()
-        end
         __CGROUP_LOADED[n] = true
         __found_one_group = true
+      end
+    end
+    local fp = io.open(path.."/release_agent", "r")
+    local ragent = fp:read("*a")
+    fp:close()
+    -- we only write a release agent if not already one. update if it looks like
+    -- a ulatencyd release agent
+    if ragent == "" or ragent == "\n" or string.sub(ragent, -22) == '/ulatencyd_cleanup.lua' then
+      local fp = io.open(path.."/release_agent", "w")
+      if fp then
+        fp:write(ulatency.release_agent)
+        fp:close()
       end
     end
   else
@@ -354,11 +380,11 @@ end
 ulatency.add_timeout(cgroups_cleanup, 120000)
 
 function CGroup.new(name, init, tree)
-  rv = _CGroup_Cache[name]
+  tree = tree or "cpu"
+  rv = _CGroup_Cache[tree..'/'..name]
   if rv then
     return rv
   end
-  tree = tree or "cm"
   if CGROUP_DEFAULT[tree] then
     cinit = table.copy(CGROUP_DEFAULT[tree])
   else
@@ -367,7 +393,7 @@ function CGroup.new(name, init, tree)
   uncommited=table.merge(cinit, init or {})
   rv = setmetatable( {name=name, uncommited=uncommited, new_tasks={},
                       tree=tree, adjust={}, used=false}, CGroupMeta)
-  _CGroup_Cache[name] = rv
+  _CGroup_Cache[tree..'/'..name] = rv
   return rv
 end
 
@@ -384,7 +410,7 @@ function CGroup:path(file)
   if file then
     return CGROUP_ROOT .. self.tree .. "/".. self.name .. "/" .. tostring(file)
   else
-   return CGROUP_ROOT .. self.tree .. "/" .. self.name
+    return CGROUP_ROOT .. self.tree .. "/" .. self.name
   end
 end
 
@@ -457,28 +483,45 @@ end
 --end
 
 
-function CGroup:add_task(pid, instant)
-  nt = rawget(self, "new_tasks")
+function CGroup:add_task_list(pid, tasks, instant)
+  local nt = rawget(self, "new_tasks")
   if not nt then
     nt = {}
     rawset(self, "new_tasks", nt)
   end
-  nt[#nt+1] = pid
-  --pprint(nt)
+  for i,v in ipairs(tasks) do
+      nt[#nt+1] = v
+  end
   if instant then
-    --print("instant")
     local t_file = self:path("tasks")
     fp = io.open(t_file, "w")
-    --print(t_file)
     if fp then
-      fp:write(tostring(pid))
-    --  print("write")
+      for i,v in tasks do
+        fp:write(tostring(v)..'\n')
+        fp:flush()
+      end
+      ulatency.log_sched("Move "..pid.." to "..tostring(self).." tasks: "..table.concat(tasks, ","))
       fp:close()
     else
       cg_log("can't attach "..pid.." to group "..t_file)
     end
   end
 end
+
+function CGroup:add_task(pid, instant)
+  if instant then
+    return self:add_task_list(pid, {pid}, instant)
+  else
+    local nt = rawget(self, "new_tasks")
+    if not nt then
+      nt = {}
+      rawset(self, "new_tasks", nt)
+    end
+    nt[#nt+1] = pid
+    return
+  end
+end
+
 
 function CGroup:is_dirty()
   if #rawget(self, "uncommited") > 0 or
@@ -540,15 +583,14 @@ function CGroup:commit()
   if fp then
     local pids = rawget(self, "new_tasks")
     if pids then
-      while true do
-        pid = table.remove(pids, 1)
-        if not pid then
-          break
-        end
-        fp:write(pid)
+      for i, pid in ipairs(pids) do
+        fp:write(tostring(pid)..'\n')
+        fp:flush()
       end
-      fp:close()
+      ulatency.log_sched("Move to "..tostring(self).." tasks: "..table.concat(pids, ","))
+      rawset(self, "new_tasks", {})
     end
+    fp:close()
   end
 end
 
@@ -561,20 +603,21 @@ function CGroup:add_children(proc, fnc)
       end
     end
     for i,v in pairs(list) do
-      add_childs(v.children)
+      add_childs(v:get_children())
     end
   end
-  add_childs(proc.children)
+  add_childs(proc:get_children())
 end
 
-function CGroup.create_isolation_group(proc, children)
+function CGroup.create_isolation_group(proc, children, fnc)
   ng = CGroup.new("iso_"..tostring(pid))
-  ng.commit()
-  ng.add_task(proc.pid)
+  ng:commit()
+  ng:add_task(proc.pid)
   proc:set_block_scheduler(1)
   if children then
-    ng:add_children(proc, true)
+    ng:add_children(proc, fnc)
   end
+  return ng
 end
 
 function CGroup:starve(what)

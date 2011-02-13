@@ -7,6 +7,7 @@ INCLUDE (CheckIncludeFiles)
 
 
 option(CONFIG_PREFIX "config prefix" "/etc")
+option(SYSTEMD_DIR "systemd service file directory" "/lib/systemd/system")
 
 option(DEVELOP_MODE "build for development" FALSE)
 option(LIBCGROUPS "add libcgroups support (BROKEN)" FALSE)
@@ -164,6 +165,8 @@ install(DIRECTORY rules
         DESTINATION ${CONFIG_PREFIX}/ulatencyd 
         FILES_MATCHING PATTERN "*.lua"
         PATTERN "test.lua" EXCLUDE)
+install(FILES conf/ulatencyd.service
+	DESTINATION ${SYSTEMD_DIR})
 
 # FIXME how to find out where to put it ???
 install(FILES conf/org.quamquam.ulatencyd.conf
