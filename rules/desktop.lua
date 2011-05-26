@@ -22,15 +22,21 @@ local MediaPlayer = {
   "vlc",
   "xine",
   "mplayer.*",
-  "dragon",
-  "totem",
-  "kplayer",
+--  "dragon",
+--  "totem",
+--  "kplayer",
+  "kaffeine",
   -- audio players
   "amarok",
-  "parole",
-  "listen",
+--  "parole",
+--  "listen",
   "rhythmbox",
-  "exaile",
+--  "exaile",
+  "cmus",
+  "ogg123",
+--  "mpg123",
+  "yauap",
+  "mpg321",
 }
 
 
