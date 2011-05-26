@@ -11,27 +11,6 @@ require("posix")
 u_groups = {}
 
 
---[[
-
-FIXME tests 
-
-grp = CGroup.new("bla/blubb")
-print("grp", grp)
-print(grp:path())
-print(grp:parent())
-grp:set_value("cpu.shares", 1302)
-grp:commit()
-pprint(grp:get_tasks())
-grp:add_task(1, true)
-pprint(grp:get_tasks())
-
-]]--
-
-function get_user_group(uid)
-  return CGroup.new("u_"..tostring(uid))
-end
-
-
 local UL_PID = posix.getpid()["pid"]
 
 ul_group_cpu = CGroup.new("s_ul", { ["cpu.shares"]="500"}, "cpu")
@@ -45,8 +24,8 @@ ul_group_cpu:commit()
 -- WARNING: don't use non alpha numeric characters in name
 -- FIXME: build validator
 
-local function check_label(labels, proc)
-  for j, flag in pairs(proc:list_flags()) do
+function check_label(labels, proc)
+  for j, flag in pairs(proc:list_flags(true)) do
     for k, slabel in pairs(labels) do
       if flag.name == slabel then
         return true
@@ -158,24 +137,29 @@ local function map_to_group(proc, parts, subsys)
 end
 
 
-Scheduler = {C_FILTER = false, ITERATION = 1, TRACE = ulatency.get_config("logging", "trace_scheduler") == "true"}
+Scheduler = {C_FILTER = false, ITERATION = 1}
 
 function Scheduler:all()
   local group
-  self.C_FILTER = not ulatency.get_flags_changed()
+  if ulatency.get_flags_changed() then
+    self.C_FILTER = false
+  end
   for j, flag in pairs(ulatency.list_flags()) do
     if flag.name == "pressure" or flag.name == "emergency" then
       self.C_FILTER = false
     end
   end
-  if self.ITERATION > (tonumber(ulatency.get_config("scheduler", "mapping")) or 15) then
+  if self.ITERATION > (tonumber(ulatency.get_config("scheduler", "full_run") or 15)) then
     self.C_FILTER = false
     self.ITERATION = 1
   end
   -- list only changed processes
+  self:update_caches()
+
+  ulatency.log_debug("scheduler filter:".. tostring(self.C_FILTER))
   for k,proc in ipairs(ulatency.list_processes(self.C_FILTER)) do
---    print("sched", proc, proc.cmdline)
-    self:one(proc)
+    --print("sched", proc, proc.cmdline)
+    self:one(proc, false)
   end
   self.C_FILTER = true
   self.ITERATION = self.ITERATION + 1
@@ -186,6 +170,9 @@ end
 function Scheduler:load_config(name)
   if not name then
     name = ulatency.get_config("scheduler", "mapping")
+    if not name then
+      ulatency.log_error("no default scheduler config specified in config file")
+    end
   end
   ulatency.log_info("Scheduler use mapping: "..name)
   local mapping_name = "SCHEDULER_MAPPING_"..string.upper(name)
@@ -204,9 +191,22 @@ function Scheduler:load_config(name)
   return true
 end
 
+function Scheduler:update_caches()
+  Scheduler.meminfo = ulatency.get_meminfo()
+  Scheduler.vminfo = ulatency.get_vminfo()
+end
+
 function Scheduler:one(proc)
+  return self:_one(proc, true)
+end
+
+function Scheduler:_one(proc, single)
   if not self.MAPPING then
     self:load_config()
+  end
+
+  if single then
+    self:update_caches()
   end
 
   if proc.block_scheduler == 0 then
@@ -215,14 +215,12 @@ function Scheduler:one(proc)
       proc:clear_changed()
       return true
     end
-    for subsys,map in pairs(self.MAPPING) do
-      if ulatency.tree_loaded(subsys) then
+    for x,subsys in ipairs(ulatency.get_cgroup_subsystems()) do
+      map = self.MAPPING[subsys] or SCHEDULER_MAPPING_DEFAULT[subsys]
+      if map and ulatency.tree_loaded(subsys) then
         local mappings = run_list(proc, map)
         --pprint(mappings)
         group = map_to_group(proc, mappings, subsys)
-        if(self.TRACE) then
-          print(proc, group)
-        end
         --print(tostring(group))
         --pprint(mappings)
         --print(tostring(proc.pid) .. " : ".. tostring(group))
@@ -231,14 +229,18 @@ function Scheduler:one(proc)
             group:commit()
           end
           --print("add task", proc.pid, group)
-          group:add_task_list(proc.pid, proc:get_tasks(true))
-          group:commit()
-          proc:clear_changed()
+          -- get_current_tasks can fail if the process is already dead
+          local tasks = proc:get_current_task_pids(true)
+          if tasks then
+            group:add_task_list(proc.pid, tasks)
+            group:commit()
+          end
         else
-          ulatency.log_debug("no group found for: "..tostring(proc))
+          ulatency.log_debug("no group found for: "..tostring(proc).." subsystem:"..tostring(subsys))
         end
       end
     end
+    proc:clear_changed()
     --pprint(build_path_parts(proc, res))
   end
   return true
@@ -249,7 +251,13 @@ function Scheduler:list_configs()
   for k,v in pairs(getfenv()) do
     if string.sub(k, 1, 18 ) == "SCHEDULER_MAPPING_" then
       name = string.lower(string.sub(k, 19))
-      rv[#rv+1] = name
+      if v.info then
+        if not v.info.hidden then
+          rv[#rv+1] = name
+        end
+      else
+        rv[#rv+1] = name
+      end
     end
   end
   return rv
@@ -258,8 +266,8 @@ end
 function Scheduler:get_config_description(name)
   name = string.upper(name)
   local mapping = getfenv()["SCHEDULER_MAPPING_" .. name]
-  if mapping then
-    return mapping.description
+  if mapping and mapping.info then
+    return mapping.info.description
   end
 end
 
@@ -270,7 +278,7 @@ function Scheduler:set_config(config)
   end
   local rv = self:load_config(config)
   if rv then
-    self.C_FILTER = true
+    self.C_FILTER = false
     ulatency.run_iteration()
   end
   return rv
@@ -283,65 +291,7 @@ function Scheduler:get_config()
   return nil
 end
 
-
-function byby()
-  ulatency.quit_daemon()
-
-end
-
---ulatency.add_timeout(byby, 100000)
-
+-- register scheduler
 ulatency.scheduler = Scheduler
 
-
---[[
-
--- OLD libcgroup crap
-
-function mk_group(name)
-  grp = cgroups.new_cgroup("/"..name)
-  cpu = grp:add_controller("cpu")
-  print("cpu", cpu)
-  cpu:add_value("cpu.shares", 2048)
-  return grp
-end
-
-function apply(srcgroup)
-  print(srcgroup:get_name())
-  grp = cgroups.new_cgroup(srcgroup:get_name())
-  rv = grp:get_cgroup()
-  if(rv ~= 0) then
-    print("can't read kernel", rv)
-  end
-  
-  rv = grp:copy_from(srcgroup)
-  if(rv ~= 0) then
-    print("can't copy source", rv)
-  end
-  rv = grp:modify_cgroup()
-  if (rv ~= 0) then
-    print("can't mod croups", rv)
-  end
-
-end
-
-
---u_groups[""] = mk_group("")
-print("1")
---u_groups["s_daemon"] = root_group:create_cgroup_from_parent("/daemon")
-u_groups["s_daemon"] = mk_group("s_daemon")
-print("2")
-
-
-function get_user_group(uid)
-  name = "u_"..tostring(uid)
-  grp = u_groups[name]
-  if not grp then
-    grp = mk_group(name)
-    u_groups[name] = grp
-    grp:create_cgroup()
-  end
-  return grp
-end
-
---]]
+ulatency.load_rule_directory("scheduler/")

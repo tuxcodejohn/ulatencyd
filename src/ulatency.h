@@ -20,6 +20,7 @@
 #ifndef __ulatency_h__
 #define __ulatency_h__
 #include <glib.h>
+#include <gio/gio.h>
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
@@ -30,7 +31,13 @@
 
 #ifdef ENABLE_DBUS
 #include <dbus/dbus-glib.h>
+#include <dbus/dbus.h>
 #endif
+
+#ifdef POLKIT_FOUND
+#include <polkit/polkit.h>
+#endif
+
 //#include <libcgroup.h>
 
 
@@ -45,11 +52,11 @@
                                __VA_ARGS__)
 
 
-#define VERSION 0.4.6
+#define VERSION 0.5.0
 
 #define OPENPROC_FLAGS (PROC_FILLMEM | \
   PROC_FILLUSR | PROC_FILLGRP | PROC_FILLSTATUS | PROC_FILLSTAT | \
-  PROC_FILLWCHAN | PROC_FILLCGROUP | PROC_FILLSUPGRP | PROC_FILLCGROUP)
+  PROC_FILLWCHAN | PROC_FILLCGROUP | PROC_FILLSUPGRP | PROC_FILLCGROUP | PROC_LOOSE_TASKS)
 
 #define OPENPROC_FLAGS_MINIMAL (PROC_FILLSTATUS)
 
@@ -88,13 +95,15 @@ enum FILTER_TYPES {
 };
 
 enum FILTER_FLAGS {
-  FILTER_STOP          = (1<<0),
+  FILTER_STOP         = (1<<0),
   FILTER_SKIP_CHILD   = (1<<1),
+  FILTER_RERUN_EXEC   = (1<<2),
+  FILTER_SKIP_THREADS = (1<<3),
 };
 
 #define FILTER_TIMEOUT(v) ( v & 0xFFFF)
 #define FILTER_FLAGS(v) ( v >> 16)
-#define FILTER_MIX(flages,timeout) (( flags << 16 ) | timeout )
+#define FILTER_MIX(flags,timeout) (( flags << 16 ) | timeout )
 
 
 enum FILTER_PRIORITIES {
@@ -129,49 +138,53 @@ struct lua_filter {
 };
 
 struct filter_block {
-  unsigned int pid;
   GTime timeout;
-  gboolean skip;
+  int flags;
 };
 
 
-typedef struct _u_proc {
+typedef struct {
   U_HEAD;
-  int           pid; // duplicate of proc.tgid
-  int           ustate; // status bits for process
-  struct proc_t proc;
-  char        **cgroup_origin; // the original cgroups this process was created in
-  GArray        proc_history;
-  int           history_len;
-  guint         last_update; // for detecting dead processes
-  GNode         *node; // for parent/child lookups
-  GHashTable    *skip_filter;
-  GList         *flags;
-  int           changed; // flags or main parameters of process like uid, gid, sid
-  void          *filter_owner;
-  int           block_scheduler; // this should be respected by the scheduler
-  GArray        *tasks; // pointer array of all task process pids. These are threads in userspace
+  int           pid;            //!< duplicate of proc.tgid
+  int           ustate;         //!< status bits for process
+  struct proc_t proc;           //!< main data storage
+  char        **cgroup_origin;  //!< the original cgroups this process was created in
+  GArray        proc_history;   //!< list of history elements
+  int           history_len;    //!< desigered history len
+  guint         last_update;    //!< counter for detecting dead processes
+  GNode         *node;          //!< for parent/child lookups and transversal
+  GHashTable    *skip_filter;   //!< storage of #filter_block for filters
+  GList         *flags;         //!< list of #u_flag
+  int           changed;        //!< flags or main parameters of process like uid, gid, sid changed
+  int           block_scheduler; //!< indicates that the process should not be touched by the scheduler
+  GPtrArray     *tasks;         //!< pointer array to all process tasks of type #u_task 
+  int           received_rt;    //!< indicates a process had realtime prio at least once
 
-  int           lua_data;
+  int           lua_data;       //!< id for per process lua storage
   // we don't use the libproc parsers here as we do not update these values
   // that often
-  char          *cmdfile;
-  char          *cmdline_match;
-  GHashTable    *environ; // str:str hash table
-  GPtrArray     *cmdline;
-  char          *exe;
+  char          *cmdfile;       //!< basename of exe file
+  GPtrArray     *cmdline;       //!< array of char * of cmdline arguments
+  char          *cmdline_match; //!< space concated version of cmdline
+  GHashTable    *environ;       //!< char *:char * hash table of process environment
+  char          *exe;           //!< executeable of the process
 
   // fake pgid because it can't be changed.
-  pid_t         fake_pgrp;
+  pid_t         fake_pgrp;      //!< fake value for pgrp
   pid_t         fake_pgrp_old;
-  pid_t         fake_session;
+  pid_t         fake_session;   //!< fake value of session
   pid_t         fake_session_old;
 } u_proc;
+
+typedef struct {
+  u_proc *proc;   //!< process this task belongs to
+  proc_t task;
+} u_task;
 
 typedef struct _filter {
   U_HEAD;
   enum FILTER_TYPES type;
-  char *name;
+  char *name;                                //!< name of filter
   int (*precheck)(struct _filter *filter);
   int (*check)(u_proc *pr, struct _filter *filter);
   int (*postcheck)(struct _filter *filter);
@@ -203,6 +216,7 @@ typedef struct _FLAG {
 //  FLAG_BEHAVIOUR age;
   char          *name;         // label name
   char          *reason;       // why the flag was set. This makes most sense with emergency flags
+  int64_t        tid;           // task id, if != 0 belongs to a process task
   time_t         timeout;       // timeout when the flag will disapear
   int32_t        priority;      // custom data: priority
   int64_t        value;         // custom data: value
@@ -216,9 +230,10 @@ void u_flag_free(void *data);
 
 int u_flag_add(u_proc *proc, u_flag *flag);
 int u_flag_del(u_proc *proc, u_flag *flag);
-int u_flag_clear_source(u_proc *proc, void *source);
+int u_flag_clear_source(u_proc *proc, const void *source);
 int u_flag_clear_name(u_proc *proc, const char *name);
 int u_flag_clear_all(u_proc *proc);
+int u_flag_clear_flag(u_proc *proc, const void *flag);
 int u_flag_clear_timeout(u_proc *proc, time_t timeout);
 
 struct u_cgroup {
@@ -301,15 +316,38 @@ extern int    system_flags_changed;
 #ifdef ENABLE_DBUS
 extern DBusGConnection *U_dbus_connection; // usully the system bus, but may differ on develop mode
 extern DBusGConnection *U_dbus_connection_system; // always the system bus
-#endif
 
+struct callback_data;
+
+struct callback_data {
+    GCancellable *cancellable;
+    DBusConnection *connection;
+    DBusMessage *message;
+    void (*callback)(struct callback_data *data);
+    void *user_data;
+};
+#endif
+#ifdef POLKIT_FOUND
+PolkitAuthority *U_polkit_authority;
+
+int check_polkit(const char *methode,
+             DBusConnection *connection,
+             DBusMessage *context,
+             char *action_id,
+             void (*callback)(struct callback_data *data),
+             void *user_data,
+             int allow_user_interaction,
+             u_proc *proc, char *config);
+#else
+#define check_polkit(...) FALSE
+#endif
 
 //extern gchar *load_pattern;
 
 // core.c
 int load_modules(char *path);
-int load_rule_directory(char *path, char *load_pattern, int fatal);
-int load_rule_file(char *name);
+int load_rule_directory(const char *path, const char *load_pattern, int fatal);
+int load_rule_file(const char *name);
 int load_lua_rule_file(lua_State *L, const char *name);
 
 /* u_proc* u_proc_new(proc_t proc)
@@ -322,9 +360,6 @@ int load_lua_rule_file(lua_State *L, const char *name);
 u_proc* u_proc_new(proc_t *proc);
 void cp_proc_t(const struct proc_t *src,struct proc_t *dst);
 
-static inline u_proc *proc_by_pid(pid_t pid) {
-  return g_hash_table_lookup(processes, GUINT_TO_POINTER(pid));
-}
 
 enum ENSURE_WHAT {
   BASIC,
@@ -335,14 +370,16 @@ enum ENSURE_WHAT {
 };
 
 int u_proc_ensure(u_proc *proc, enum ENSURE_WHAT what, int update);
+GList *u_proc_list_flags (u_proc *proc, gboolean recrusive);
+GArray *u_proc_get_current_task_pids(u_proc *proc);
 
 
 u_filter *filter_new();
-void filter_register(u_filter *filter);
+void filter_register(u_filter *filter, int instant);
 void filter_free(u_filter *filter);
 void filter_unregister(u_filter *filter);
 void filter_run();
-void filter_for_proc(u_proc *proc);
+void filter_for_proc(u_proc *proc, GList *list);
 
 int filter_run_for_proc(gpointer data, gpointer user_data);
 void cp_proc_t(const struct proc_t *src, struct proc_t *dst);
@@ -350,15 +387,29 @@ void cp_proc_t(const struct proc_t *src, struct proc_t *dst);
 // notify system of a new pids/changed/dead pids
 int process_new(pid_t pid, int noupdate);
 int process_new_delay(pid_t pid, pid_t parent);
-int process_new_list(GArray *list, int noupdate);
+int process_new_list(GArray *list, int noupdate, int instant);
 int process_remove(u_proc *proc);
 int process_remove_by_pid(pid_t pid);
 // low level update api
 int process_update_pids(pid_t pids[]);
 int process_update_pid(pid_t pid);
-int process_run_one(u_proc *proc, int update);
+int process_run_one(u_proc *proc, int update, int instant);
+void clear_process_skip_filters(u_proc *proc, int block_types);
 
 int process_update_all();
+
+static inline u_proc *proc_by_pid(pid_t pid) {
+  return g_hash_table_lookup(processes, GUINT_TO_POINTER(pid));
+}
+
+static inline u_proc *proc_by_pid_with_retry(pid_t pid) {
+  u_proc *proc = g_hash_table_lookup(processes, GUINT_TO_POINTER(pid));
+  if(proc)
+    return proc;
+  if(process_update_pid(pid))
+    return g_hash_table_lookup(processes, GUINT_TO_POINTER(pid));
+  return NULL;
+}
 
 
 int scheduler_run_one(u_proc *proc);
@@ -378,6 +429,17 @@ double get_last_percent();
 // misc stuff
 guint get_plugin_id();
 
+// tools.c
+
+struct u_timer {
+  GTimer *timer;
+  int count;
+};
+
+void recursive_rmdir(const char *path, int add_level);
+void u_timer_start(struct u_timer *t);
+void u_timer_stop(struct u_timer *t);
+void u_timer_stop_clear(struct u_timer *t);
 
 // lua_binding
 int l_filter_run_for_proc(u_proc *pr, u_filter *flt);
@@ -402,7 +464,7 @@ GHashTable * u_read_env_hash (pid_t pid);
 char *       u_pid_get_env (pid_t pid, const char *var);
 GPtrArray *  search_user_env(uid_t uid, const char *name, int update);
 GPtrArray *  u_read_0file (pid_t pid, const char *what);
-
+uint64_t     get_number_of_processes();
 
 // dbus consts
 #define U_DBUS_SERVICE_NAME     "org.quamquam.ulatencyd"

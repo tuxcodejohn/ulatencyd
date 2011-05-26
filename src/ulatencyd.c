@@ -52,7 +52,7 @@ DBusGConnection *U_dbus_connection_system;
 #include <sys/mman.h>
 #include <error.h>
 
-static gchar *config_file = QUOTEME(CONFIG_FILE);
+static gchar *config_file = QUOTEME(CONFIG_PATH)"/ulatencyd.conf";
 static gchar *rules_directory = QUOTEME(RULES_DIRECTORY);
 static gchar *modules_directory = QUOTEME(MODULES_DIRECTORY);
 static gchar *load_pattern = NULL;
@@ -62,6 +62,7 @@ static char *log_file = NULL;
 int          log_fd = -1;
 
 GKeyFile *config_data;
+static char *config_cgroup_root;
 
 /*
 static gint max_size = 8;
@@ -100,7 +101,7 @@ static GOptionEntry entries[] =
   { "verbose", 'v', G_OPTION_FLAG_OPTIONAL_ARG, G_OPTION_ARG_CALLBACK, &opt_verbose, "More verbose. Can be passed multiple times", NULL },
   { "quiet", 'q', G_OPTION_FLAG_OPTIONAL_ARG, G_OPTION_ARG_CALLBACK, &opt_quiet, "More quiet. Can be passed multiple times", NULL },
   { "log-file", 'f', 0, G_OPTION_ARG_FILENAME, &log_file, "Log to file", NULL},
-  { "daemonize", 'd', G_OPTION_FLAG_NO_ARG, G_OPTION_ARG_NONE, &opt_daemon, "Run daemon in background", NULL },
+  { "daemonize", 'd', 0, G_OPTION_ARG_NONE, &opt_daemon, "Run daemon in background", NULL },
   { NULL }
 };
 
@@ -298,7 +299,7 @@ void load_config() {
   if(!g_key_file_load_from_file(config_data, config_file, 
                                 G_KEY_FILE_KEEP_COMMENTS|G_KEY_FILE_KEEP_TRANSLATIONS,
                                 &error)) {
-    g_log(G_LOG_DOMAIN, G_LOG_LEVEL_WARNING, "could not load config file: %s: %s", config_file, error->message);
+    g_error("could not load config file: %s: %s", config_file, error->message);
   }
 
   filter_interval = g_key_file_get_integer(config_data, CONFIG_CORE, "interval", NULL);
@@ -362,7 +363,7 @@ gboolean            g_spawn_sync                        ("/",
 static int do_dbus_init() {
   GError *error = NULL;
   DBusConnection *con;
-#ifdef DEVELOP_MODE
+#ifdef DEVELOP_DBUS_SESSION
   char *env_uid;
   uid_t target = 0;
   if(getuid() == 0) {
@@ -429,6 +430,8 @@ signal_logrotate (int signal)
 
 int timeout_long(gpointer data) {
 
+  static int run = 0;
+
   // check if dbus connection is still alive
 #ifdef ENABLE_DBUS
   if(U_dbus_connection) {
@@ -443,9 +446,13 @@ int timeout_long(gpointer data) {
   }
 #endif
 
-  // try the make current memory non swapalbe
-  if(mlockall(MCL_CURRENT) && getuid() == 0)
-    g_log(G_LOG_DOMAIN, G_LOG_LEVEL_INFO, "can't mlock memory");
+  if(run == 0 && config_cgroup_root) {
+    g_debug("cleanup cgroup directory: %s", config_cgroup_root);
+    // FIXME: why causes this hung tasks in the kernel ????
+    //recursive_rmdir(config_cgroup_root, 2);
+  }
+  run = (run + 1)%10;
+
 
   return TRUE;
 }
@@ -528,7 +535,7 @@ int main (int argc, char *argv[])
 #endif
 
   g_atexit(cleanup);
-  
+
   if (signal (SIGABRT, signal_cleanup) == SIG_IGN)
     signal (SIGABRT, SIG_IGN);
   if (signal (SIGINT, signal_cleanup) == SIG_IGN)
@@ -542,15 +549,37 @@ int main (int argc, char *argv[])
 
 
 
-  
   //signal (SIGABRT, cleanup_on_abort);
   core_init();
+  // set the cgroups root path
+  lua_getfield(lua_main_state, LUA_GLOBALSINDEX, "CGROUP_ROOT"); /* function to be called */
+  config_cgroup_root = g_strdup(lua_tostring(lua_main_state, -1));
+  lua_pop(lua_main_state, 1);
+
+  if(!strcmp(config_cgroup_root, "/") || !strcmp(config_cgroup_root, "")) {
+      g_warning("bad cgroup root path: %s", config_cgroup_root);
+      g_free(config_cgroup_root);
+      config_cgroup_root = NULL;
+  }
+
+  if(config_cgroup_root) {
+      g_debug("cleanup cgroup directory: %s", config_cgroup_root);
+      recursive_rmdir(config_cgroup_root, 2);
+  }
+
   adj_oom_killer(getpid(), -1000);
   load_modules(modules_directory);
   load_rule_directory(rules_directory, load_pattern, TRUE);
 
   process_update_all();
-  init_netlink(main_loop);
+
+  gboolean el = g_key_file_get_boolean(config_data, "core", "netlink", &error);
+  if(el || error)
+    init_netlink(main_loop);
+  else
+    g_message("netlink support disabled. no fast reactions possible");
+  if(error)
+    g_error_free(error), error = NULL;
 
   // small hack
   timeout_long(NULL);
@@ -560,7 +589,6 @@ int main (int argc, char *argv[])
   g_timeout_add_seconds(filter_interval, iterate, GUINT_TO_POINTER(1));
 
   g_log(G_LOG_DOMAIN, G_LOG_LEVEL_MESSAGE, "ulatencyd started successfull");
-  if(g_main_loop_is_running(main_loop));
-    g_main_loop_run(main_loop);
+  g_main_loop_run(main_loop);
   return 0;
 }

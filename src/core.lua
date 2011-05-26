@@ -16,10 +16,19 @@
     You should have received a copy of the GNU General Public License 
     along with ulatencyd. If not, see http://www.gnu.org/licenses/.
 ]]--
+
+---------------------------------
+--! @file
+--! @brief ulatencyd core lua library
+---------------------------------
+
 posix = require("posix")
 
 -- monkey patching lua core
 
+--! @brief split string with seperator sep
+--! @param sep seperator
+--! @return new table with chunks
 function string:split(sep)
         local sep, fields = sep or ":", {}
         local pattern = string.format("([^%s]+)", sep)
@@ -27,6 +36,9 @@ function string:split(sep)
         return fields
 end
 
+--! @brief copies tables
+--! @param t table
+--! @return new table with shallow copy
 function table.copy(t)
   local t2 = {}
   for k,v in pairs(t) do
@@ -35,6 +47,11 @@ function table.copy(t)
   return t2
 end
 
+
+--! @brief merge two tables
+--! @param t table of source 1
+--! @param t2 table of source 2
+--! @return table t
 function table.merge(t, t2)
   for k,v in pairs(t2) do
     t[k] = v
@@ -45,6 +62,9 @@ end
 
 -- logging shortcuts
 
+--! @brief log with level trace
+--! @param msg message
+--! @return nil
 function ulatency.log_trace(msg)
   ulatency.log(ulatency.LOG_LEVEL_TRACE, msg)
 end
@@ -167,7 +187,8 @@ function ulatency.tree_loaded(name)
   return __CGROUP_LOADED[name]
 end
 
-
+--! @brief returns boolean if name is available
+--! @param name name of subsystem to test
 function ulatency.has_cgroup_subsystem(name)
   if not __CGROUP_HAS then
     ulatency.get_cgroup_subsystems()
@@ -175,8 +196,11 @@ function ulatency.has_cgroup_subsystem(name)
   return (__CGROUP_HAS[name] == true)
 end
 
-
+--!@brief returns a table of available cgroup subsystems
 function ulatency.get_cgroup_subsystems()
+  if __CGROUP_AVAIL then
+    return __CGROUP_AVAIL
+  end
   __CGROUP_AVAIL = {}
   __CGROUP_HAS = {}
   for line in io.lines("/proc/cgroups") do 
@@ -279,6 +303,7 @@ end
 -- try mounting the mountpoints
 if not is_mounted(CGROUP_ROOT) then
   -- try mounting a tmpfs there
+  mkdirp(CGROUP_ROOT)
   local prog = "/bin/mount -n -t tmpfs none "..CGROUP_ROOT.."/"
   ulatency.log_info("mount cgroups root: "..prog)
   fd = io.popen(prog, "r")
@@ -340,6 +365,11 @@ for n,v in pairs(CGROUP_MOUNTPOINTS) do
         fp:write(ulatency.release_agent)
         fp:close()
       end
+    end
+    local fp = io.open(path.."/notify_on_release", "w")
+    if fp then
+      fp:write("1")
+      fp:close()
     end
   else
     ulatency.log_info("no cgroups subsystem found for group "..n..". disable group")
@@ -683,4 +713,22 @@ end
 
 function pprint(data)
   print(vardump(data))
+end
+
+
+function num_or_percent(conf, value, default)
+  local rv = false
+  if not conf and default then
+    conf = default
+  end
+  if not conf then
+    conf = "100%"
+  end
+  for w in string.gmatch(conf, "(%d+)%%") do
+     return ((value)/100)*tonumber(w)
+  end
+  if not conf then
+    return value
+  end
+  return conf
 end

@@ -7,9 +7,8 @@ INCLUDE (CheckIncludeFiles)
 
 
 option(CONFIG_PREFIX "config prefix" "/etc")
-option(SYSTEMD_DIR "systemd service file directory" "/lib/systemd/system")
-
 option(DEVELOP_MODE "build for development" FALSE)
+option(DEVELOP_DBUS_SESSION "export to session dbus" FALSE)
 option(LIBCGROUPS "add libcgroups support (BROKEN)" FALSE)
 option(LUA_JIT "enable luajit support when available" FALSE)
 option(ENABLE_DBUS "enable dbus" TRUE)
@@ -29,11 +28,16 @@ if(ENABLE_DBUS)
   if(DBUS_FOUND)
     set(ENABLE_DBUS 1)
     pkg_check_modules(GTHREAD gthread-2.0 REQUIRED)
+    pkg_check_modules(POLKIT polkit-gobject-1)
   endif(DBUS_FOUND)
 endif(ENABLE_DBUS)
 
 pkg_check_modules(GIO gio-2.0 REQUIRED)
 
+if(POLKIT_FOUND)
+  INCLUDE (CheckLibraryExists)
+  CHECK_LIBRARY_EXISTS(polkit-gobject-1 polkit_authority_get_sync "" POLKIT_HAVE_GET_SYNC)
+endif(POLKIT_FOUND)
 
 # FIXME: libproc should export more symbols
 # find libproc
@@ -54,6 +58,8 @@ pkg_check_modules(GIO gio-2.0 REQUIRED)
 SET(CONFIG_PREFIX "/etc" CACHE STRING
       "Config prefix"
       FORCE)
+SET(SYSTEMD_DIR "/lib/systemd/system" CACHE STRING
+      "systemd service file directory")
 
 set(LIBPROC_INCLUDE_DIRS src)
 #set(LIBPROC_LIBRARY src/proc/libproc.a)
@@ -100,7 +106,7 @@ configure_file(src/config.h.tmpl ${CMAKE_CURRENT_BINARY_DIR}/src/config.h)
 
 include_directories (${CMAKE_CURRENT_BINARY_DIR}/src ${LIBCGROUP_INCLUDE_DIRS}
                      ${LIBPROC_INCLUDE_DIRS} ${GLIB2_INCLUDE_DIRS} ${DBUS_INCLUDE_DIRS}
-                     ${GIO_INCLUDE_DIRS})
+                     ${GIO_INCLUDE_DIRS} ${POLKIT_INCLUDE_DIRS})
 
 IF(LUA_JIT AND LUAJIT_FOUND)
   include_directories (${LUAJIT_INCLUDE_DIRS})
@@ -120,6 +126,7 @@ add_subdirectory(src/proc)
 add_subdirectory(src)
 add_subdirectory(modules)
 add_subdirectory(tests)
+add_subdirectory(docs)
 
 
 #SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wall")
@@ -161,16 +168,46 @@ install(FILES conf/ulatencyd.conf
         DESTINATION ${CONFIG_PREFIX}/ulatencyd)
 install(FILES conf/cgroups.conf 
         DESTINATION ${CONFIG_PREFIX}/ulatencyd)
+install(FILES conf/simple.conf
+        DESTINATION ${CONFIG_PREFIX}/ulatencyd)
 install(DIRECTORY rules 
         DESTINATION ${CONFIG_PREFIX}/ulatencyd 
         FILES_MATCHING PATTERN "*.lua"
         PATTERN "test.lua" EXCLUDE)
-install(FILES conf/ulatencyd.service
-	DESTINATION ${SYSTEMD_DIR})
+install(DIRECTORY conf/simple.d
+        DESTINATION ${CONFIG_PREFIX}/ulatencyd
+        PATTERN "*~" EXCLUDE)
+install(DIRECTORY conf/scheduler
+        DESTINATION ${CONFIG_PREFIX}/ulatencyd
+        PATTERN "*~" EXCLUDE)
+
+# install client files
+FILE(GLOB cl RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+    "client/ulatency*")
+SET(client "${cl}" "${client}")
+FILE(GLOB cl RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
+    "client/run-*")
+SET(client "${cl}" "${client}")
+
+install(PROGRAMS ${client}
+        DESTINATION bin)
+
+if(NOT "${SYSTEMD_DIR}" STREQUAL "")
+  install(FILES conf/ulatencyd.service
+          DESTINATION ${SYSTEMD_DIR})
+endif (NOT "${SYSTEMD_DIR}" STREQUAL "")
 
 # FIXME how to find out where to put it ???
-install(FILES conf/org.quamquam.ulatencyd.conf
+IF(DBUS_FOUND AND ENABLE_DBUS)
+  install(FILES conf/org.quamquam.ulatencyd.conf
         DESTINATION /etc/dbus-1/system.d)
+ENDIF(DBUS_FOUND AND ENABLE_DBUS)
+
+if(POLKIT_FOUND)
+  install(FILES conf/org.quamquam.ulatencyd.policy
+          DESTINATION ${POLKIT_PREFIX}/share/polkit-1/actions)
+endif(POLKIT_FOUND)
+
 
 #install(TARGETS mySharedLib DESTINATION /some/full/path)
 

@@ -68,6 +68,4 @@ DesktopEssential = {
 }
 
 
-ulatency.register_filter(DesktopBG)
-ulatency.register_filter(DesktopMedia)
 ulatency.register_filter(DesktopEssential)

@@ -110,19 +110,26 @@ get_localhost()
 
     if (buf) {
       buf_len += buf_len;
-      if ((buf = realloc (buf, buf_len)) == NULL)
-        err(1, NULL);
+      if ((buf = realloc (buf, buf_len)) == NULL) {
+          g_warning("malloc failed");
+          return NULL;
+      }
     } else {
       buf_len = 128;        /* Initial guess */
-      if ((buf = malloc (buf_len)) == NULL)
-        err(1, NULL);
+      buf = malloc(buf_len);
+      if (!buf) {
+          g_warning("malloc failed");
+          return NULL;
       }
+    }
   } while (((myerror = gethostname(buf, buf_len)) == 0 && !memchr (buf, '\0', buf_len))
           || errno == ENAMETOOLONG);
 
   /* gethostname failed, abort. */
-  if (myerror)
-    err(1, NULL);
+  if (myerror) {
+    g_warning("can't get hostname");
+    return NULL;
+  }
 
   return buf;
 }
@@ -164,7 +171,11 @@ int create_connection(struct x_server *xs) {
   setenv("HOME", pw->pw_dir, 1);
   unsetenv("XAUTHORITY");
   i = -1;
-  seteuid(xs->uid);
+  if(seteuid(xs->uid)) {
+      g_warning("can't seteuid to %d", xs->uid);
+      goto error;
+  }
+
   do {
     xs->connection = xcb_connect(xs->display, &screenNum);
 
@@ -184,7 +195,9 @@ int create_connection(struct x_server *xs) {
     setenv("XAUTHORITY", g_ptr_array_index(xauthptr, i), 1);
   } while(TRUE);
 
-  seteuid(0);
+  if((getuid() == 0) && seteuid(0)) {
+      g_error("can't switch back to root");
+  }
 
   g_ptr_array_unref(xauthptr);
 
@@ -332,7 +345,7 @@ struct x_server *add_connection(const char *name, uid_t uid, const char *display
 pid_t read_pid(struct x_server *conn, int *err) {
   xcb_generic_error_t *error;
   *err = 0;
-  pid_t rv;
+  pid_t rv = 0;
 
   dprint("dsp: %s xs: %p conn: %p\n", conn->display, conn, conn->connection);
 
@@ -418,10 +431,11 @@ pid_t read_pid(struct x_server *conn, int *err) {
   return rv;
 error:
   // error in connection. free x_server connection
-  if(error->response_type == 0 && error->error_code == 3)
+  if(error && error->response_type == 0 && error->error_code == 3)
     return 0;
   *err = 1;
-  g_debug("xcb error: %d %d\n", error->response_type, error->error_code);
+  if(error)
+    g_debug("xcb error: %d %d\n", error->response_type, error->error_code);
   return 0;
 }
 
@@ -459,7 +473,6 @@ static gboolean update_all_server(gpointer data) {
     } else {
       i++;
     }
-    csess = g_list_next(csess);
   }
   csess = g_list_first(U_session_list);
   while(csess) {
@@ -518,6 +531,10 @@ static gboolean update_all_server(gpointer data) {
 
 int xwatch_init() {
   localhost = get_localhost();
+  if(!localhost) {
+    g_warning("can't find localhost name\n");
+    return 0;
+  }
   xwatch_id = get_plugin_id();
 #ifndef TEST_XWATCH
   GError *error = NULL;
