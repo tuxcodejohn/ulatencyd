@@ -320,3 +320,69 @@ SCHEDULER_MAPPING_DESKTOP["blkio"] =
   },
 }
 
+SCHEDULER_MAPPING_DESKTOP["bfqio"] =
+{
+  {
+    name = "poison",
+    label = { "user.poison", "user.poison.group" },
+    cgroups_name = "psn_${pgrp}",
+    param = { ["bfqio.weight"]="1" },
+    adjust = function(cgroup, proc)
+                save_io_prio(proc, 7, ulatency.IOPRIO_CLASS_IDLE)
+             end,
+  },
+  {
+    name = "active",
+    cgroups_name = "usr_${euid}_active",
+    param = { ["bfqio.weight"]="1000" },
+    check = function(proc)
+        return proc.is_active
+      end,
+    adjust = function(cgroup, proc)
+                save_io_prio(proc, 3, ulatency.IOPRIO_CLASS_BE)
+             end,
+  },
+  { 
+    name = "ui",
+    label = { "user.ui" },
+    adjust = function(cgroup, proc)
+                save_io_prio(proc, 2, ulatency.IOPRIO_CLASS_BE)
+             end,
+  },
+  {
+    name = "idle",
+    param = { ["bfqio.weight"]="1" },
+    label = { "daemon.idle", "user.idle" },
+    adjust = function(cgroup, proc)
+                save_io_prio(proc, 5, ulatency.IOPRIO_CLASS_IDLE)
+             end,
+  },
+  {
+    name = "media",
+    param = { ["bfqio.weight"]="300" },
+    cgroups_name = "grp_${pgrp}",
+    label = { "user.media"},
+    adjust = function(cgroup, proc)
+                save_io_prio(proc, 7, ulatency.IOPRIO_CLASS_RT)
+             end,
+  },
+  {
+    name = "group",
+    param = { ["bfqio.weight"]="300" },
+    cgroups_name = "grp_${pgrp}",
+    check = function(proc)
+              return proc.pgrp > 0
+            end,
+    adjust = function(cgroup, proc)
+                restore_io_prio(proc)
+             end,
+  },
+  {
+    name = "kernel",
+    cgroups_name = "",
+    check = function(proc)
+              return (proc.vm_size == 0)
+            end
+  },
+}
+
